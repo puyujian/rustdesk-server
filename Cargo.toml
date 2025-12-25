@@ -19,7 +19,7 @@ path = "src/utils.rs"
 [dependencies]
 hbb_common = { path = "libs/hbb_common" }
 serde_derive = "1.0"
-serde = "=1.0.217"  # 锁定版本以避免 cross 编译时 GLIBC 兼容问题
+serde = "1.0"
 serde_json = "1.0"
 lazy_static = "1.4"
 clap = "2"
@@ -51,8 +51,6 @@ ipnetwork = "0.20"
 local-ip-address = "0.5.1"
 dns-lookup = "1.0.8"
 ping = "0.4.0"
-dashmap = "=5.5.3"
-libc = "=0.2.169"  # 锁定版本以避免 cross 编译时 GLIBC 兼容问题
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support

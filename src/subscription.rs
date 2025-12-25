@@ -4,11 +4,12 @@
 //! - hbbs: 通过 token 检查订阅状态，写入 relay 白名单
 //! - hbbr: 消费 relay 白名单验证
 
-use dashmap::DashMap;
 use hbb_common::log;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 /// API 服务器地址
@@ -31,7 +32,8 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 });
 
 /// 订阅状态缓存: token_hash -> (is_active, cached_at)
-static SUBSCRIPTION_CACHE: Lazy<DashMap<String, (bool, Instant)>> = Lazy::new(DashMap::new);
+static SUBSCRIPTION_CACHE: Lazy<RwLock<HashMap<String, (bool, Instant)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 缓存 TTL - 订阅有效 (秒)
 const CACHE_TTL_ACTIVE_SECS: u64 = 300; // 5 分钟
@@ -63,6 +65,7 @@ struct RelayConsumeData {
 }
 
 /// Relay Allow 响应数据
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct RelayAllowData {
     uuid: String,
@@ -100,23 +103,36 @@ pub async fn check_subscription_by_token(token: &str) -> bool {
     let cache_key = hash_token(token);
 
     // 1. 查缓存 (读时清理过期条目)
-    if let Some(entry) = SUBSCRIPTION_CACHE.get(&cache_key) {
-        let (is_active, cached_at) = *entry;
-        let ttl = get_cache_ttl(is_active);
-        if cached_at.elapsed() < ttl {
-            log::debug!("Subscription cache hit: active={}", is_active);
-            return is_active;
+    {
+        let cache = SUBSCRIPTION_CACHE.read().unwrap();
+        if let Some(&(is_active, cached_at)) = cache.get(&cache_key) {
+            let ttl = get_cache_ttl(is_active);
+            if cached_at.elapsed() < ttl {
+                log::debug!("Subscription cache hit: active={}", is_active);
+                return is_active;
+            }
         }
-        // 过期则删除
-        drop(entry);
-        SUBSCRIPTION_CACHE.remove(&cache_key);
+    }
+
+    // 过期则删除 (需要写锁)
+    {
+        let mut cache = SUBSCRIPTION_CACHE.write().unwrap();
+        if let Some(&(is_active, cached_at)) = cache.get(&cache_key) {
+            let ttl = get_cache_ttl(is_active);
+            if cached_at.elapsed() >= ttl {
+                cache.remove(&cache_key);
+            }
+        }
     }
 
     // 2. 调用 API (使用 POST body 传递 token，避免泄露到日志)
     let result = call_subscription_check_api(token).await;
 
     // 3. 更新缓存
-    SUBSCRIPTION_CACHE.insert(cache_key, (result, Instant::now()));
+    {
+        let mut cache = SUBSCRIPTION_CACHE.write().unwrap();
+        cache.insert(cache_key, (result, Instant::now()));
+    }
 
     result
 }
@@ -291,8 +307,8 @@ async fn call_subscription_check_api(token: &str) -> bool {
 fn handle_api_failure(token: &str) -> bool {
     // 尝试使用旧缓存
     let cache_key = hash_token(token);
-    if let Some(entry) = SUBSCRIPTION_CACHE.get(&cache_key) {
-        let (is_active, _) = *entry;
+    let cache = SUBSCRIPTION_CACHE.read().unwrap();
+    if let Some(&(is_active, _)) = cache.get(&cache_key) {
         log::warn!("Using stale cache for subscription check");
         return is_active;
     }
@@ -306,7 +322,8 @@ pub fn cleanup_caches() {
     let now = Instant::now();
 
     // 清理订阅缓存 (保留 2 倍 TTL 以支持 stale cache)
-    SUBSCRIPTION_CACHE.retain(|_, (is_active, cached_at)| {
+    let mut cache = SUBSCRIPTION_CACHE.write().unwrap();
+    cache.retain(|_, (is_active, cached_at)| {
         let max_ttl = if *is_active {
             CACHE_TTL_ACTIVE_SECS * 2
         } else {
