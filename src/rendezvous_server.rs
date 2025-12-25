@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::subscription;
 use hbb_common::bytes::BufMut;
 use hbb_common::{
     allow_err, bail,
@@ -494,6 +495,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        conn_subscription_ok: &mut bool,  // 连接级别的订阅状态
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             // log::debug!("Received TCP message from {}: {:?}", addr, msg_in);
@@ -525,7 +527,7 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws, conn_subscription_ok).await);
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -533,6 +535,19 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+
+                    // [订阅验证] 检查该连接是否已通过订阅验证 (使用连接级别状态)
+                    if MUST_LOGIN.load(Ordering::SeqCst) {
+                        if !*conn_subscription_ok {
+                            log::info!("RequestRelay from {} rejected: subscription not verified", addr);
+                            return true;
+                        }
+                        // 写入 relay 白名单，允许 hbbr 验证
+                        if !rf.uuid.is_empty() {
+                            subscription::allow_relay(&rf.uuid, 2, 120).await;
+                        }
+                    }
+
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -888,15 +903,16 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>, bool)> {  // 返回值增加 subscription_ok
         let mut ph = ph;
+        let mut subscription_ok = false;  // 订阅验证状态
         if !key.is_empty() && ph.licence_key != key {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
                 ..Default::default()
             });
-            return Ok((msg_out, None));
+            return Ok((msg_out, None, false));
         }
         // if secret is not empty check token by jwt
         if MUST_LOGIN.load(Ordering::SeqCst) {
@@ -906,10 +922,10 @@ impl RendezvousServer {
                     other_failure: String::from("Connection failed, please login!"),
                     ..Default::default()
                 });
-                return Ok((msg_out, None));
+                return Ok((msg_out, None, false));
             } else if !jwt::SECRET.is_empty() {
-                let token = ph.token;
-                let token = jwt::verify_token(token.as_str());
+                let token_str = ph.token.clone();
+                let token = jwt::verify_token(token_str.as_str());
                 if token.is_err() {
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -917,9 +933,24 @@ impl RendezvousServer {
                         other_failure: String::from("Token error, please log out and log back in!"),
                         ..Default::default()
                     });
-                    return Ok((msg_out, None));
+                    return Ok((msg_out, None, false));
                 }
+
+                // [订阅验证] JWT 验证通过后，检查订阅状态
+                if !subscription::check_subscription_by_token(&token_str).await {
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        other_failure: String::from("Subscription expired. Please renew your subscription."),
+                        ..Default::default()
+                    });
+                    return Ok((msg_out, None, false));
+                }
+                // 订阅验证通过
+                subscription_ok = true;
             }
+        } else {
+            // 未启用 MUST_LOGIN 时，默认允许
+            subscription_ok = true;
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -938,7 +969,7 @@ impl RendezvousServer {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
                     ..Default::default()
                 });
-                return Ok((msg_out, None));
+                return Ok((msg_out, None, subscription_ok));
             }
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
@@ -987,14 +1018,14 @@ impl RendezvousServer {
                 });
             }
             //
-            Ok((msg_out, Some(peer_addr)))
+            Ok((msg_out, Some(peer_addr), subscription_ok))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
             });
-            Ok((msg_out, None))
+            Ok((msg_out, None, subscription_ok))
         }
     }
 
@@ -1049,8 +1080,13 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        conn_subscription_ok: &mut bool,  // 连接级别的订阅状态
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr, subscription_ok) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        // 更新连接级别的订阅状态
+        if subscription_ok {
+            *conn_subscription_ok = true;
+        }
         if let Some(addr) = to_addr {
             let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
             if let Some(s) = sink.as_mut() {
@@ -1071,7 +1107,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        let (msg, to_addr, _subscription_ok) = self.handle_punch_hole_request(addr, ph, key, false).await?;
         self.tx.send(Data::Msg(
             msg.into(),
             match to_addr {
@@ -1344,6 +1380,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let mut conn_subscription_ok = false;  // 连接级别的订阅状态
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1369,7 +1406,7 @@ impl RendezvousServer {
             }));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut conn_subscription_ok).await {
                         break;
                     }
                 }
@@ -1394,7 +1431,7 @@ impl RendezvousServer {
                         }
                     }
                 }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut conn_subscription_ok).await {
                     break;
                 }
             }

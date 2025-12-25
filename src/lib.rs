@@ -5,3 +5,4 @@ mod database;
 mod peer;
 mod version;
 pub mod jwt;
+pub mod subscription;

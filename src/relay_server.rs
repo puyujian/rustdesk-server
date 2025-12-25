@@ -25,8 +25,10 @@ use std::{
     io::prelude::*,
     io::Error,
     net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+
+use crate::subscription;
 
 type Usage = (usize, usize, usize, usize);
 
@@ -45,9 +47,22 @@ static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024); // in
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
+// [订阅验证] 是否启用订阅验证 (通过环境变量 MUST_LOGIN 控制)
+static SUBSCRIPTION_CHECK: AtomicBool = AtomicBool::new(false);
+
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
     let key = get_server_sk(key);
+
+    // [订阅验证] 从环境变量读取是否启用订阅验证
+    if let Ok(v) = std::env::var("MUST_LOGIN") {
+        let v = v.to_uppercase();
+        if v == "Y" || v == "YES" || v == "TRUE" || v == "1" {
+            SUBSCRIPTION_CHECK.store(true, Ordering::SeqCst);
+            log::info!("Subscription check enabled for relay");
+        }
+    }
+
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -430,6 +445,15 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                 if !key.is_empty() && rf.licence_key != key {
                     return;
                 }
+
+                // [订阅验证] 检查 relay 白名单
+                if SUBSCRIPTION_CHECK.load(Ordering::SeqCst) && !rf.uuid.is_empty() {
+                    if !subscription::consume_relay(&rf.uuid).await {
+                        log::info!("Relay request {} from {} rejected: not in whitelist", rf.uuid, addr);
+                        return;
+                    }
+                }
+
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
