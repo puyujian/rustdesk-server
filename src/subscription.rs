@@ -13,8 +13,11 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 /// API 服务器地址
+/// 优先读取 API_SERVER，其次读取 RUSTDESK_API_RUSTDESK_API_SERVER
 pub static API_SERVER: Lazy<String> = Lazy::new(|| {
-    env::var("API_SERVER").unwrap_or_else(|_| "http://127.0.0.1:21114".to_string())
+    env::var("API_SERVER")
+        .or_else(|_| env::var("RUSTDESK_API_RUSTDESK_API_SERVER"))
+        .unwrap_or_else(|_| "http://127.0.0.1:21114".to_string())
 });
 
 /// 内部 API 密钥 (可选)
