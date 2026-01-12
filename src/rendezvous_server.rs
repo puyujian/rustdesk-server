@@ -914,7 +914,8 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None, false));
         }
-        // if secret is not empty check token by jwt
+        // MUST_LOGIN=Y 时要求客户端携带 token；若配置了 RUSTDESK_API_JWT_KEY，则进行 JWT 校验。
+        // 注意：RUSTDESK_API_JWT_KEY 允许为空，此时只做“必须携带 token”的限制（与 README 描述一致）。
         if MUST_LOGIN.load(Ordering::SeqCst) {
             if ph.token.is_empty() {
                 let mut msg_out = RendezvousMessage::new();
@@ -923,10 +924,12 @@ impl RendezvousServer {
                     ..Default::default()
                 });
                 return Ok((msg_out, None, false));
-            } else if !jwt::SECRET.is_empty() {
-                let token_str = ph.token.clone();
-                let token = jwt::verify_token(token_str.as_str());
-                if token.is_err() {
+            }
+
+            let token_str = ph.token.clone();
+
+            if !jwt::SECRET.is_empty() {
+                if jwt::verify_token(token_str.as_str()).is_err() {
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
                         //提示重新登录
@@ -940,14 +943,17 @@ impl RendezvousServer {
                 if !subscription::check_subscription_by_token(&token_str).await {
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
-                        other_failure: String::from("Subscription expired. Please renew your subscription."),
+                        other_failure: String::from(
+                            "Subscription expired. Please renew your subscription.",
+                        ),
                         ..Default::default()
                     });
                     return Ok((msg_out, None, false));
                 }
-                // 订阅验证通过
-                subscription_ok = true;
             }
+
+            // token 非空且（如启用）校验通过，则允许继续握手/请求 relay
+            subscription_ok = true;
         } else {
             // 未启用 MUST_LOGIN 时，默认允许
             subscription_ok = true;

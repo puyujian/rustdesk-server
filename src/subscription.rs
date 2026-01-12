@@ -15,8 +15,22 @@ use std::time::{Duration, Instant};
 /// API 服务器地址
 /// 优先读取 API_SERVER，其次读取 RUSTDESK_API_RUSTDESK_API_SERVER
 pub static API_SERVER: Lazy<String> = Lazy::new(|| {
-    env::var("API_SERVER")
-        .or_else(|_| env::var("RUSTDESK_API_RUSTDESK_API_SERVER"))
+    // 1) 显式指定内部 API 地址（推荐用于多容器/独立部署）
+    if let Ok(v) = env::var("API_SERVER") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+
+    // 2) 未设置内部密钥时，rustdesk-api 内部接口默认只允许 loopback，强制走 127.0.0.1
+    let internal_key = env::var("RUSTDESK_API_INTERNAL_KEY").unwrap_or_default();
+    if internal_key.is_empty() {
+        return "http://127.0.0.1:21114".to_string();
+    }
+
+    // 3) 设置了内部密钥后，允许走外部 API 地址（兼容旧环境变量写法）
+    env::var("RUSTDESK_API_RUSTDESK_API_SERVER")
         .unwrap_or_else(|_| "http://127.0.0.1:21114".to_string())
 });
 
