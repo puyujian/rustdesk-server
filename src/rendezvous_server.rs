@@ -574,6 +574,32 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    // [订阅验证] 预先写入 relay 白名单，避免 hbbr 因“not in whitelist”拒绝连接。
+                    //
+                    // MUST_LOGIN=Y 时 hbbr 会启用白名单扣次（/api/internal/relay/consume）。
+                    // 部分客户端在收到 RelayResponse 后会直接连接 hbbr，不一定会先发 RequestRelay 到 hbbs，
+                    // 因此这里在转发 RelayResponse（携带 uuid）时提前 allow。
+                    //
+                    // 安全性：仅当存在对应的 tcp_punch 会话（addr_b 之前确实发起过请求）才写入，
+                    // 避免伪造 RelayResponse 滥用写白名单。
+                    if MUST_LOGIN.load(Ordering::SeqCst) && !rr.uuid.is_empty() {
+                        let has_punch = self
+                            .tcp_punch
+                            .lock()
+                            .await
+                            .contains_key(&try_into_v4(addr_b));
+                        if has_punch {
+                            let ok = subscription::allow_relay(&rr.uuid, 2, 120).await;
+                            if !ok {
+                                log::warn!(
+                                    "Relay allow failed for uuid={} (from {}, to {})",
+                                    rr.uuid,
+                                    addr,
+                                    addr_b
+                                );
+                            }
+                        }
+                    }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
