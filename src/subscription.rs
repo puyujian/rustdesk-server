@@ -59,7 +59,7 @@ const CACHE_TTL_ACTIVE_SECS: u64 = 300; // 5 分钟
 const CACHE_TTL_INACTIVE_SECS: u64 = 60; // 1 分钟
 
 /// API 超时 (毫秒)
-const API_TIMEOUT_MS: u64 = 500;
+const API_TIMEOUT_MS: u64 = 3000;
 
 /// API 响应结构
 #[derive(Deserialize, Debug)]
@@ -143,15 +143,28 @@ pub async fn check_subscription_by_token(token: &str) -> bool {
     }
 
     // 2. 调用 API (使用 POST body 传递 token，避免泄露到日志)
+    // 返回 Some(bool) 表示 API 成功响应，None 表示 API 调用失败
     let result = call_subscription_check_api(token).await;
 
-    // 3. 更新缓存
-    {
-        let mut cache = SUBSCRIPTION_CACHE.write().unwrap();
-        cache.insert(cache_key, (result, Instant::now()));
+    // 3. 仅在 API 成功响应时更新缓存，避免超时/网络错误导致缓存 false
+    match result {
+        Some(is_active) => {
+            let mut cache = SUBSCRIPTION_CACHE.write().unwrap();
+            cache.insert(cache_key, (is_active, Instant::now()));
+            is_active
+        }
+        None => {
+            // API 调用失败，尝试使用旧缓存
+            let cache = SUBSCRIPTION_CACHE.read().unwrap();
+            if let Some(&(is_active, _)) = cache.get(&cache_key) {
+                log::warn!("API failed, using stale cache: active={}", is_active);
+                return is_active;
+            }
+            // 无缓存时拒绝 (保守策略)
+            log::warn!("API failed, no cache available, denying access");
+            false
+        }
     }
-
-    result
 }
 
 /// 写入 relay 白名单 (用于 hbbs RequestRelay 时调用)
@@ -264,7 +277,8 @@ pub async fn consume_relay(uuid: &str) -> bool {
 // ============ 内部辅助函数 ============
 
 /// 调用订阅检查 API (使用 POST body 传递 token)
-async fn call_subscription_check_api(token: &str) -> bool {
+/// 返回 Some(bool) 表示 API 成功响应，None 表示 API 调用失败（超时/网络错误/非200状态码）
+async fn call_subscription_check_api(token: &str) -> Option<bool> {
     let url = format!("{}/api/internal/subscription/check", *API_SERVER);
 
     // 使用 POST body 传递 token，避免泄露到 URL/日志
@@ -287,51 +301,37 @@ async fn call_subscription_check_api(token: &str) -> bool {
                         // 检查 code
                         if api_resp.code != 0 && api_resp.code != 200 {
                             log::error!("Subscription API failed: code={}", api_resp.code);
-                            return handle_api_failure(token);
+                            return None; // API 业务错误，不缓存
                         }
                         if let Some(data) = api_resp.data {
                             if let Ok(sub_data) = serde_json::from_value::<SubscriptionData>(data) {
                                 // 支付未启用时视为放行
                                 if !sub_data.payment_enabled {
                                     log::debug!("Payment disabled, allowing access");
-                                    return true;
+                                    return Some(true);
                                 }
                                 log::debug!("Subscription check: active={}", sub_data.active);
-                                return sub_data.active;
+                                return Some(sub_data.active);
                             }
                         }
                         log::error!("Subscription API: invalid response data");
-                        handle_api_failure(token)
+                        None // 响应格式异常，不缓存
                     }
                     Err(e) => {
                         log::error!("Subscription API parse error: {}", e);
-                        handle_api_failure(token)
+                        None // 解析失败，不缓存
                     }
                 }
             } else {
                 log::error!("Subscription API status: {}", resp.status());
-                handle_api_failure(token)
+                None // HTTP 非 200，不缓存
             }
         }
         Err(e) => {
             log::error!("Subscription API call failed: {}", e);
-            handle_api_failure(token)
+            None // 网络错误/超时，不缓存
         }
     }
-}
-
-/// API 失败时的处理策略
-fn handle_api_failure(token: &str) -> bool {
-    // 尝试使用旧缓存
-    let cache_key = hash_token(token);
-    let cache = SUBSCRIPTION_CACHE.read().unwrap();
-    if let Some(&(is_active, _)) = cache.get(&cache_key) {
-        log::warn!("Using stale cache for subscription check");
-        return is_active;
-    }
-    // 无缓存时拒绝 (保守策略)
-    log::warn!("No cache available, denying access");
-    false
 }
 
 /// 清理过期缓存 (可由外部定时调用)
